@@ -6,6 +6,8 @@
 #include <QStringList>
 #include <QVariantMap>
 
+struct mosquitto;
+
 class AbstractTransportClient : public QObject {
   Q_OBJECT
 
@@ -80,12 +82,24 @@ class MqttTransportClient : public AbstractTransportClient {
 
 public:
   explicit MqttTransportClient(ChannelKey channel, QObject *parent = nullptr);
+  ~MqttTransportClient() override;
   bool isOpen() const override;
 
 public slots:
   void open(const QVariantMap &config) override;
   void closeClient() override;
   void sendPayload(const QString &payload, PayloadFormat format, const QVariantMap &meta = {}) override;
+
+private:
+  friend void mqttConnectCallback(struct mosquitto *client, void *userdata, int rc);
+  friend void mqttDisconnectCallback(struct mosquitto *client, void *userdata, int rc);
+  friend void mqttMessageCallback(struct mosquitto *client, void *userdata, const struct mosquitto_message *message);
+
+  struct mosquitto *m_client = nullptr;
+  QString m_publishTopic;
+  QString m_subscribeTopic;
+  bool m_connected = false;
+  bool m_closing = false;
 };
 
 QStringList availableSerialPorts();

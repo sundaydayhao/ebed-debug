@@ -13,10 +13,14 @@
 #include <QSerialPortInfo>
 #endif
 
-#ifdef EBED_HAS_QT_MQTT
-#include <QMqttClient>
-#include <QMqttTopicFilter>
-#include <QMqttTopicName>
+#ifdef EBED_HAS_MOSQUITTO
+#include <QMetaObject>
+
+#include <mosquitto.h>
+
+void mqttConnectCallback(struct mosquitto *client, void *userdata, int rc);
+void mqttDisconnectCallback(struct mosquitto *client, void *userdata, int rc);
+void mqttMessageCallback(struct mosquitto *client, void *userdata, const struct mosquitto_message *message);
 #endif
 
 namespace {
@@ -45,8 +49,30 @@ QString serialModuleUnavailableMessage() {
 }
 
 QString mqttModuleUnavailableMessage() {
-  return QStringLiteral("Qt MQTT 模块未编译进当前程序，MQTT 通道不可用。请安装 qt6-mqtt-dev 后重新执行 cmake -S . -B build && cmake --build build。");
+  return QStringLiteral("MQTT 后端未编译进当前程序，MQTT 通道不可用。请安装 libmosquitto-dev 后重新执行 cmake -S . -B build && cmake --build build。");
 }
+
+#ifdef EBED_HAS_MOSQUITTO
+struct MosquittoRuntime {
+  MosquittoRuntime() { mosquitto_lib_init(); }
+  ~MosquittoRuntime() { mosquitto_lib_cleanup(); }
+};
+
+MosquittoRuntime &mosquittoRuntime() {
+  static MosquittoRuntime runtime;
+  return runtime;
+}
+
+QString mqttLibraryErrorText(int code) {
+  const char *text = mosquitto_strerror(code);
+  return QString::fromUtf8(text ? text : "unknown error");
+}
+
+QString mqttConnAckText(int code) {
+  const char *text = mosquitto_connack_string(code);
+  return QString::fromUtf8(text ? text : "unknown connack");
+}
+#endif
 
 }  // namespace
 
@@ -203,45 +229,88 @@ void SerialTransportClient::sendPayload(const QString &payload, PayloadFormat fo
 
 MqttTransportClient::MqttTransportClient(ChannelKey channel, QObject *parent) : AbstractTransportClient(channel, parent) {}
 
+MqttTransportClient::~MqttTransportClient() {
+  closeClient();
+}
+
 bool MqttTransportClient::isOpen() const {
-#ifdef EBED_HAS_QT_MQTT
-  const auto *client = findChild<QMqttClient *>();
-  return client && client->state() == QMqttClient::Connected;
+#ifdef EBED_HAS_MOSQUITTO
+  return m_connected;
 #else
   return false;
 #endif
 }
 
 void MqttTransportClient::open(const QVariantMap &config) {
-#ifdef EBED_HAS_QT_MQTT
-  QMqttClient *client = findChild<QMqttClient *>();
-  if (!client) {
-    client = new QMqttClient(this);
-    connect(client, &QMqttClient::connected, this, [this, client, config]() {
-      emit statusChanged("MQTT connected", "ok");
-      const QString subscribeTopic = config.value("subscribeTopic").toString();
-      if (!subscribeTopic.isEmpty()) {
-        client->subscribe(QMqttTopicFilter(subscribeTopic));
-      }
-    });
-    connect(client, &QMqttClient::disconnected, this, [this]() { emit statusChanged("MQTT closed", "warn"); });
-    connect(client, &QMqttClient::messageReceived, this, [this](const QByteArray &message, const QMqttTopicName &topic) {
-      emit dataReceived(QString::fromUtf8(message), PayloadFormat::Text, topic.name());
-    });
-    connect(client, &QMqttClient::errorChanged, this, [this](QMqttClient::ClientError error) {
-      if (error != QMqttClient::NoError) {
-        emit statusChanged(QString("MQTT error %1").arg(static_cast<int>(error)), "error");
-      }
-    });
+#ifdef EBED_HAS_MOSQUITTO
+  closeClient();
+  mosquittoRuntime();
+  const QUrl url(config.value("url").toString());
+  if (!url.isValid() || url.host().isEmpty()) {
+    emit statusChanged(QStringLiteral("MQTT Broker URL 无效。"), "error");
+    return;
   }
 
-  const QUrl url(config.value("url").toString());
-  client->setHostname(url.host());
-  client->setPort(url.port(url.scheme() == "mqtts" ? 8883 : 1883));
-  client->setUsername(config.value("username").toString());
-  client->setPassword(config.value("password").toByteArray());
-  client->setClientId(config.value("clientId").toString());
-  client->connectToHost();
+  const QString scheme = url.scheme().isEmpty() ? QStringLiteral("mqtt") : url.scheme().toLower();
+  if (scheme != "mqtt" && scheme != "mqtts") {
+    emit statusChanged(QStringLiteral("MQTT 仅支持 mqtt:// 或 mqtts:// URL。"), "error");
+    return;
+  }
+
+  const QByteArray clientId = config.value("clientId").toString().trimmed().toUtf8();
+  m_client = mosquitto_new(clientId.isEmpty() ? nullptr : clientId.constData(), true, this);
+  if (!m_client) {
+    emit statusChanged(QStringLiteral("MQTT 客户端初始化失败。"), "error");
+    return;
+  }
+
+  m_publishTopic = config.value("publishTopic").toString();
+  m_subscribeTopic = config.value("subscribeTopic").toString();
+  m_connected = false;
+  m_closing = false;
+
+  mosquitto_connect_callback_set(m_client, mqttConnectCallback);
+  mosquitto_disconnect_callback_set(m_client, mqttDisconnectCallback);
+  mosquitto_message_callback_set(m_client, mqttMessageCallback);
+
+  const QByteArray username = config.value("username").toString().toUtf8();
+  const QByteArray password = config.value("password").toByteArray();
+  if (!username.isEmpty() || !password.isEmpty()) {
+    const int authResult = mosquitto_username_pw_set(m_client, username.isEmpty() ? nullptr : username.constData(), password.constData());
+    if (authResult != MOSQ_ERR_SUCCESS) {
+      emit statusChanged(QString("MQTT 鉴权配置失败：%1").arg(mqttLibraryErrorText(authResult)), "error");
+      mosquitto_destroy(m_client);
+      m_client = nullptr;
+      return;
+    }
+  }
+
+  if (scheme == "mqtts") {
+    const int tlsResult = mosquitto_tls_set(m_client, nullptr, "/etc/ssl/certs", nullptr, nullptr, nullptr);
+    if (tlsResult != MOSQ_ERR_SUCCESS) {
+      emit statusChanged(QString("MQTT TLS 配置失败：%1").arg(mqttLibraryErrorText(tlsResult)), "error");
+      mosquitto_destroy(m_client);
+      m_client = nullptr;
+      return;
+    }
+  }
+
+  const QByteArray host = url.host().toUtf8();
+  const int port = url.port(scheme == "mqtts" ? 8883 : 1883);
+  const int connectResult = mosquitto_connect_async(m_client, host.constData(), port, 60);
+  if (connectResult != MOSQ_ERR_SUCCESS) {
+    emit statusChanged(QString("MQTT 连接启动失败：%1").arg(mqttLibraryErrorText(connectResult)), "error");
+    mosquitto_destroy(m_client);
+    m_client = nullptr;
+    return;
+  }
+
+  const int loopResult = mosquitto_loop_start(m_client);
+  if (loopResult != MOSQ_ERR_SUCCESS) {
+    emit statusChanged(QString("MQTT 后台循环启动失败：%1").arg(mqttLibraryErrorText(loopResult)), "error");
+    mosquitto_destroy(m_client);
+    m_client = nullptr;
+  }
 #else
   Q_UNUSED(config)
   emit statusChanged(mqttModuleUnavailableMessage(), "error");
@@ -249,21 +318,60 @@ void MqttTransportClient::open(const QVariantMap &config) {
 }
 
 void MqttTransportClient::closeClient() {
-#ifdef EBED_HAS_QT_MQTT
-  if (auto *client = findChild<QMqttClient *>(); client) {
-    client->disconnectFromHost();
+#ifdef EBED_HAS_MOSQUITTO
+  if (!m_client) {
+    return;
+  }
+
+  const bool wasConnected = m_connected;
+  m_closing = true;
+
+  mosquitto_connect_callback_set(m_client, nullptr);
+  mosquitto_disconnect_callback_set(m_client, nullptr);
+  mosquitto_message_callback_set(m_client, nullptr);
+  mosquitto_disconnect(m_client);
+  mosquitto_loop_stop(m_client, true);
+  mosquitto_destroy(m_client);
+
+  m_client = nullptr;
+  m_connected = false;
+  m_publishTopic.clear();
+  m_subscribeTopic.clear();
+  m_closing = false;
+
+  if (wasConnected) {
+    emit statusChanged("MQTT closed", "warn");
   }
 #endif
 }
 
-void MqttTransportClient::sendPayload(const QString &payload, PayloadFormat, const QVariantMap &meta) {
-#ifdef EBED_HAS_QT_MQTT
-  if (auto *client = findChild<QMqttClient *>(); client && client->state() == QMqttClient::Connected) {
-    const QString topic = meta.value("topic").toString();
-    client->publish(QMqttTopicName(topic), payload.toUtf8());
+void MqttTransportClient::sendPayload(const QString &payload, PayloadFormat format, const QVariantMap &meta) {
+#ifdef EBED_HAS_MOSQUITTO
+  if (m_client && m_connected) {
+    const QString topic = meta.value("topic", m_publishTopic).toString();
+    if (topic.trimmed().isEmpty()) {
+      emit statusChanged(QStringLiteral("MQTT 发布 Topic 为空。"), "error");
+      return;
+    }
+
+    const QByteArray bytes = payloadToBytes(payload, format);
+    const QByteArray topicUtf8 = topic.toUtf8();
+    const int publishResult = mosquitto_publish(
+      m_client,
+      nullptr,
+      topicUtf8.constData(),
+      bytes.size(),
+      bytes.constData(),
+      0,
+      false
+    );
+    if (publishResult != MOSQ_ERR_SUCCESS) {
+      emit statusChanged(QString("MQTT 发布失败：%1").arg(mqttLibraryErrorText(publishResult)), "error");
+    }
   }
 #else
   Q_UNUSED(payload)
+  Q_UNUSED(format)
   Q_UNUSED(meta)
 #endif
 }
@@ -290,9 +398,75 @@ bool serialSupportAvailable() {
 }
 
 bool mqttSupportAvailable() {
-#ifdef EBED_HAS_QT_MQTT
+#ifdef EBED_HAS_MOSQUITTO
   return true;
 #else
   return false;
 #endif
 }
+
+#ifdef EBED_HAS_MOSQUITTO
+void mqttConnectCallback(struct mosquitto *, void *userdata, int rc) {
+  auto *client = static_cast<MqttTransportClient *>(userdata);
+  if (!client) {
+    return;
+  }
+
+  QMetaObject::invokeMethod(client, [client, rc]() {
+    if (client->m_closing) {
+      return;
+    }
+
+    if (rc != 0) {
+      client->m_connected = false;
+      emit client->statusChanged(QString("MQTT 连接失败：%1").arg(mqttConnAckText(rc)), "error");
+      return;
+    }
+
+    client->m_connected = true;
+    emit client->statusChanged("MQTT connected", "ok");
+
+    if (!client->m_subscribeTopic.isEmpty() && client->m_client) {
+      const QByteArray topic = client->m_subscribeTopic.toUtf8();
+      const int subscribeResult = mosquitto_subscribe(client->m_client, nullptr, topic.constData(), 0);
+      if (subscribeResult != MOSQ_ERR_SUCCESS) {
+        emit client->statusChanged(QString("MQTT 订阅失败：%1").arg(mqttLibraryErrorText(subscribeResult)), "error");
+      }
+    }
+  }, Qt::QueuedConnection);
+}
+
+void mqttDisconnectCallback(struct mosquitto *, void *userdata, int rc) {
+  auto *client = static_cast<MqttTransportClient *>(userdata);
+  if (!client) {
+    return;
+  }
+
+  QMetaObject::invokeMethod(client, [client, rc]() {
+    if (client->m_closing) {
+      return;
+    }
+
+    client->m_connected = false;
+    if (rc == 0) {
+      emit client->statusChanged("MQTT closed", "warn");
+    } else {
+      emit client->statusChanged(QString("MQTT 连接中断：%1").arg(mqttLibraryErrorText(rc)), "error");
+    }
+  }, Qt::QueuedConnection);
+}
+
+void mqttMessageCallback(struct mosquitto *, void *userdata, const struct mosquitto_message *message) {
+  auto *client = static_cast<MqttTransportClient *>(userdata);
+  if (!client || !message || !message->topic) {
+    return;
+  }
+
+  const QByteArray payload(static_cast<const char *>(message->payload), message->payloadlen);
+  const QString topic = QString::fromUtf8(message->topic);
+
+  QMetaObject::invokeMethod(client, [client, payload, topic]() {
+    emit client->dataReceived(QString::fromUtf8(payload), PayloadFormat::Text, topic);
+  }, Qt::QueuedConnection);
+}
+#endif

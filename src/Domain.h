@@ -54,6 +54,7 @@ struct ChartPoint {
   double current = 0.0;
   double temperature = 0.0;
   double rpm = 0.0;
+  ChannelKey channel = ChannelKey::Serial;
 };
 
 struct ProtocolCommand {

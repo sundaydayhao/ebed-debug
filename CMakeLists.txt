@@ -8,10 +8,24 @@ set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTORCC ON)
 set(CMAKE_AUTOUIC ON)
 
+find_package(PkgConfig QUIET)
 find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets Network)
 find_package(Qt6 COMPONENTS SerialPort QUIET)
 find_package(Qt6 COMPONENTS Charts QUIET)
-find_package(Qt6 COMPONENTS Mqtt QUIET)
+
+if(PkgConfig_FOUND)
+  pkg_check_modules(MOSQUITTO QUIET libmosquitto)
+endif()
+
+find_path(MOSQUITTO_INCLUDE_DIR
+  NAMES mosquitto.h
+  HINTS ${MOSQUITTO_INCLUDE_DIRS}
+)
+
+find_library(MOSQUITTO_LIBRARY
+  NAMES mosquitto
+  HINTS ${MOSQUITTO_LIBRARY_DIRS}
+)
 
 add_executable(ebed-debug-pro
   src/main.cpp
@@ -49,10 +63,11 @@ else()
   message(STATUS "Qt6 Charts not found: chart page will fall back to text summary")
 endif()
 
-if(TARGET Qt6::Mqtt)
-  message(STATUS "Qt6 Mqtt found: MQTT support enabled")
-  target_link_libraries(ebed-debug-pro PRIVATE Qt6::Mqtt)
-  target_compile_definitions(ebed-debug-pro PRIVATE EBED_HAS_QT_MQTT=1)
+if(MOSQUITTO_LIBRARY AND MOSQUITTO_INCLUDE_DIR)
+  message(STATUS "libmosquitto found: MQTT support enabled")
+  target_include_directories(ebed-debug-pro PRIVATE ${MOSQUITTO_INCLUDE_DIR})
+  target_link_libraries(ebed-debug-pro PRIVATE ${MOSQUITTO_LIBRARY})
+  target_compile_definitions(ebed-debug-pro PRIVATE EBED_HAS_MOSQUITTO=1)
 else()
-  message(WARNING "Qt6 Mqtt not found. MQTT support will be disabled. Install qt6-mqtt-dev, then re-run CMake.")
+  message(WARNING "libmosquitto not found. MQTT support will be disabled. Install libmosquitto-dev, then re-run CMake.")
 endif()

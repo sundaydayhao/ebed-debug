@@ -20,8 +20,10 @@
 #include <QJsonObject>
 #include <QLabel>
 #include <QLineEdit>
+#include <QListView>
 #include <QListWidget>
 #include <QMessageBox>
+#include <QPainter>
 #include <QPlainTextEdit>
 #include <QPushButton>
 #include <QRandomGenerator>
@@ -30,6 +32,7 @@
 #include <QSpinBox>
 #include <QSplitter>
 #include <QStackedWidget>
+#include <QStyledItemDelegate>
 #include <QTableWidget>
 #include <QTabWidget>
 #include <QTextEdit>
@@ -80,22 +83,124 @@ QString linesToText(const QStringList &lines) {
   return lines.join('\n');
 }
 
+QList<int> commonBaudRates() {
+  return {1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600, 1000000, 1500000, 2000000};
+}
+
+void fillNumericCombo(QComboBox *combo, const QList<int> &values, int selectedValue) {
+  combo->clear();
+  for (int value : values) {
+    combo->addItem(QString::number(value), value);
+  }
+  const int index = combo->findData(selectedValue);
+  combo->setCurrentIndex(index >= 0 ? index : 0);
+}
+
+int comboNumber(const QComboBox *combo, int fallback = 0) {
+  if (!combo) {
+    return fallback;
+  }
+  const QVariant value = combo->currentData();
+  if (value.isValid()) {
+    return value.toInt();
+  }
+  bool ok = false;
+  const int number = combo->currentText().toInt(&ok);
+  return ok ? number : fallback;
+}
+
+class ComboPopupItemDelegate : public QStyledItemDelegate {
+public:
+  using QStyledItemDelegate::QStyledItemDelegate;
+
+  QSize sizeHint(const QStyleOptionViewItem &option, const QModelIndex &index) const override {
+    QSize size = QStyledItemDelegate::sizeHint(option, index);
+    size.setHeight(qMax(size.height(), 30));
+    return size;
+  }
+
+  void paint(QPainter *painter, const QStyleOptionViewItem &option, const QModelIndex &index) const override {
+    QStyleOptionViewItem opt(option);
+    initStyleOption(&opt, index);
+
+    const bool selected = opt.state.testFlag(QStyle::State_Selected);
+    const bool hovered = opt.state.testFlag(QStyle::State_MouseOver);
+    const QColor background = selected ? QColor("#1f6f78") : (hovered ? QColor("#d9eef0") : Qt::white);
+    const QColor textColor = selected ? Qt::white : QColor("#0f172a");
+
+    painter->save();
+    painter->fillRect(opt.rect, background);
+    painter->setPen(textColor);
+    painter->setFont(opt.font);
+    painter->drawText(opt.rect.adjusted(8, 0, -8, 0), Qt::AlignLeft | Qt::AlignVCenter, opt.text);
+    painter->restore();
+  }
+};
+
+void configureComboBox(QComboBox *combo, int minContentsLength = 0, int minWidth = 0) {
+  if (!combo) {
+    return;
+  }
+
+  auto *view = new QListView(combo);
+  view->setItemDelegate(new ComboPopupItemDelegate(view));
+  view->setMouseTracking(true);
+  view->viewport()->setMouseTracking(true);
+  view->setSelectionBehavior(QAbstractItemView::SelectRows);
+  view->setSelectionMode(QAbstractItemView::SingleSelection);
+  view->setEditTriggers(QAbstractItemView::NoEditTriggers);
+  view->setUniformItemSizes(true);
+  view->setAlternatingRowColors(false);
+  view->setStyleSheet(R"(
+    QListView {
+      background: white;
+      color: #0f172a;
+      border: 1px solid #cbd5e1;
+      outline: 0;
+    }
+    QListView::item {
+      min-height: 28px;
+      padding: 4px 8px;
+    }
+  )");
+
+  QPalette palette = view->palette();
+  palette.setColor(QPalette::Base, Qt::white);
+  palette.setColor(QPalette::Text, QColor("#0f172a"));
+  palette.setColor(QPalette::Highlight, QColor("#1f6f78"));
+  palette.setColor(QPalette::HighlightedText, Qt::white);
+  palette.setColor(QPalette::Inactive, QPalette::Highlight, QColor("#1f6f78"));
+  palette.setColor(QPalette::Inactive, QPalette::HighlightedText, Qt::white);
+  view->setPalette(palette);
+
+  combo->setView(view);
+  combo->setStyleSheet(QStringLiteral("QComboBox { combobox-popup: 1; }"));
+  combo->setMaxVisibleItems(14);
+  if (minContentsLength > 0) {
+    combo->setSizeAdjustPolicy(QComboBox::AdjustToContents);
+    combo->setMinimumContentsLength(minContentsLength);
+  }
+  if (minWidth > 0) {
+    combo->setMinimumWidth(minWidth);
+  }
+}
+
 QString serialModuleHint() {
   return QStringLiteral("当前构建未启用 Qt SerialPort。请安装 qt6-serialport-dev 后重新执行 cmake -S . -B build && cmake --build build。");
 }
 
 QString mqttModuleHint() {
-  return QStringLiteral("当前构建未启用 Qt MQTT。请安装 qt6-mqtt-dev 后重新执行 cmake -S . -B build && cmake --build build。");
+  return QStringLiteral("当前构建未启用 MQTT 后端。请安装 libmosquitto-dev 后重新执行 cmake -S . -B build && cmake --build build。");
 }
 
 QString unsupportedChannelMessage(ChannelKey channel, const QString &modbusVariant = {}) {
   switch (channel) {
     case ChannelKey::Serial:
-      return serialModuleHint();
+      return serialSupportAvailable() ? QString() : serialModuleHint();
     case ChannelKey::Mqtt:
-      return mqttModuleHint();
+      return mqttSupportAvailable() ? QString() : mqttModuleHint();
     case ChannelKey::Modbus:
-      if (modbusVariant != "tcp") {
+      if (modbusVariant != "tcp" && !serialSupportAvailable()) {
         return QStringLiteral("当前构建未启用 Qt SerialPort，Modbus RTU 不可用。请安装 qt6-serialport-dev 后重新执行 cmake -S . -B build && cmake --build build。");
       }
       break;
@@ -107,6 +212,23 @@ QString unsupportedChannelMessage(ChannelKey channel, const QString &modbusVaria
   return {};
 }
 
+bool channelHasProtocolTools(ChannelKey channel) {
+  return channel == ChannelKey::Modbus || channel == ChannelKey::Can;
+}
+
+QString terminalPayloadText(const LogEntry &log, const QString &mode) {
+  if (log.format == PayloadFormat::Event) {
+    return log.payload;
+  }
+  if (mode == "ascii") {
+    return log.format == PayloadFormat::Hex ? hexToAscii(log.payload) : log.payload;
+  }
+  if (mode == "hex") {
+    return log.format == PayloadFormat::Hex ? normalizeHex(log.payload) : textToHex(log.payload);
+  }
+  return log.payload;
+}
+
 }  // namespace
 
 MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
@@ -114,7 +236,6 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
   m_templates = defaultProtocolTemplates();
   m_scripts = defaultStarterScripts();
   m_canSignals = defaultCanSignals();
-  m_chartPoints.append(ChartPoint{0, nowStamp(), 3.3, 0.42, 35.0, 1200.0});
 
   setupUi();
   populateChannels();
@@ -153,16 +274,17 @@ void MainWindow::setupUi() {
 
   auto *sidebar = new QFrame;
   sidebar->setObjectName("sidebar");
-  sidebar->setMinimumWidth(260);
+  sidebar->setMinimumWidth(230);
   auto *sidebarLayout = new QVBoxLayout(sidebar);
   sidebarLayout->setContentsMargins(20, 20, 20, 20);
   sidebarLayout->setSpacing(16);
 
-  auto *brand = new QLabel(QStringLiteral("<div style='font-size:22px;font-weight:700'>嵌入式调试上位机 Pro</div><div style='color:#94a3b8'>Qt Widgets Desktop Workstation</div>"));
+  auto *brand = new QLabel(QStringLiteral("<div style='font-size:22px;font-weight:700'>嵌入式调试上位机 Pro</div>"));
   brand->setTextFormat(Qt::RichText);
   sidebarLayout->addWidget(brand);
 
   m_channelList = new QListWidget;
+  m_channelList->setObjectName("channelList");
   connect(m_channelList, &QListWidget::currentRowChanged, this, [this](int) { onChannelSelectionChanged(); });
   sidebarLayout->addWidget(m_channelList, 1);
 
@@ -190,7 +312,11 @@ void MainWindow::setupUi() {
   headerLayout->setContentsMargins(0, 0, 0, 0);
   m_activeChannelLabel = new QLabel;
   m_activeChannelLabel->setTextFormat(Qt::RichText);
-  headerLayout->addWidget(m_activeChannelLabel, 1);
+  headerLayout->addWidget(m_activeChannelLabel);
+  m_activeChannelSummaryLabel = new QLabel;
+  m_activeChannelSummaryLabel->setWordWrap(false);
+  headerLayout->addWidget(m_activeChannelSummaryLabel);
+  headerLayout->addStretch(1);
 
   m_connectButton = new QPushButton(QStringLiteral("连接"));
   connect(m_connectButton, &QPushButton::clicked, this, &MainWindow::onConnectClicked);
@@ -223,8 +349,8 @@ void MainWindow::setupUi() {
   m_tabs = new QTabWidget;
   workspaceLayout->addWidget(m_tabs, 1);
 
-  auto *consolePage = new QWidget;
-  auto *consoleLayout = new QHBoxLayout(consolePage);
+  m_consolePage = new QWidget;
+  auto *consoleLayout = new QHBoxLayout(m_consolePage);
   consoleLayout->setContentsMargins(0, 0, 0, 0);
   consoleLayout->setSpacing(16);
 
@@ -235,7 +361,26 @@ void MainWindow::setupUi() {
 
   m_terminalView = new QPlainTextEdit;
   m_terminalView->setReadOnly(true);
-  terminalLayout->addWidget(wrapPanel(m_terminalView, QStringLiteral("收发终端"), QStringLiteral("当前通道最近 120 条日志")), 1);
+  auto *terminalPanel = new QWidget;
+  auto *terminalPanelLayout = new QVBoxLayout(terminalPanel);
+  terminalPanelLayout->setContentsMargins(0, 0, 0, 0);
+  terminalPanelLayout->setSpacing(8);
+  auto *terminalToolbar = new QWidget;
+  auto *terminalToolbarLayout = new QHBoxLayout(terminalToolbar);
+  terminalToolbarLayout->setContentsMargins(0, 0, 0, 0);
+  terminalToolbarLayout->setSpacing(8);
+  auto *terminalModeLabel = new QLabel(QStringLiteral("日志显示"));
+  m_terminalViewModeCombo = new QComboBox;
+  configureComboBox(m_terminalViewModeCombo, 7, 96);
+  m_terminalViewModeCombo->addItem(QStringLiteral("HEX"), "hex");
+  m_terminalViewModeCombo->addItem(QStringLiteral("ASCII"), "ascii");
+  connect(m_terminalViewModeCombo, qOverload<int>(&QComboBox::currentIndexChanged), this, [this](int) { refreshTerminal(); });
+  terminalToolbarLayout->addWidget(terminalModeLabel);
+  terminalToolbarLayout->addWidget(m_terminalViewModeCombo);
+  terminalToolbarLayout->addStretch(1);
+  terminalPanelLayout->addWidget(terminalToolbar);
+  terminalPanelLayout->addWidget(m_terminalView, 1);
+  terminalLayout->addWidget(wrapPanel(terminalPanel, QStringLiteral("收发终端"), QStringLiteral("当前通道最近 120 条日志")), 1);
 
   auto *composer = new QWidget;
   auto *composerLayout = new QVBoxLayout(composer);
@@ -246,6 +391,7 @@ void MainWindow::setupUi() {
   formatRowLayout->setContentsMargins(0, 0, 0, 0);
   formatRowLayout->setSpacing(8);
   m_txFormatCombo = new QComboBox;
+  configureComboBox(m_txFormatCombo, 6, 90);
   m_txFormatCombo->addItem("TEXT", static_cast<int>(PayloadFormat::Text));
   m_txFormatCombo->addItem("HEX", static_cast<int>(PayloadFormat::Hex));
   m_txFormatCombo->addItem("JSON", static_cast<int>(PayloadFormat::Json));
@@ -282,21 +428,25 @@ void MainWindow::setupUi() {
   auto *serialForm = new QFormLayout(serialFormWidget);
   m_serialPathCombo = new QComboBox;
   m_serialPathCombo->setEditable(true);
-  m_serialBaudSpin = new QSpinBox;
-  m_serialBaudSpin->setRange(1200, 2000000);
-  m_serialBaudSpin->setValue(115200);
-  m_serialDataBitsSpin = new QSpinBox;
-  m_serialDataBitsSpin->setRange(5, 8);
-  m_serialDataBitsSpin->setValue(8);
-  m_serialStopBitsSpin = new QSpinBox;
-  m_serialStopBitsSpin->setRange(1, 2);
-  m_serialStopBitsSpin->setValue(1);
+  configureComboBox(m_serialPathCombo, 12, 160);
+  m_serialBaudCombo = new QComboBox;
+  configureComboBox(m_serialBaudCombo, 8, 120);
+  fillNumericCombo(m_serialBaudCombo, commonBaudRates(), 115200);
+  m_serialDataBitsCombo = new QComboBox;
+  configureComboBox(m_serialDataBitsCombo, 4, 88);
+  fillNumericCombo(m_serialDataBitsCombo, {5, 6, 7, 8}, 8);
+  m_serialStopBitsCombo = new QComboBox;
+  configureComboBox(m_serialStopBitsCombo, 4, 88);
+  fillNumericCombo(m_serialStopBitsCombo, {1, 2}, 1);
   m_serialParityCombo = new QComboBox;
-  m_serialParityCombo->addItems({"none", "even", "odd"});
+  configureComboBox(m_serialParityCombo, 6, 110);
+  m_serialParityCombo->addItem("none", "none");
+  m_serialParityCombo->addItem("even", "even");
+  m_serialParityCombo->addItem("odd", "odd");
   serialForm->addRow(QStringLiteral("端口"), m_serialPathCombo);
-  serialForm->addRow(QStringLiteral("波特率"), m_serialBaudSpin);
-  serialForm->addRow(QStringLiteral("数据位"), m_serialDataBitsSpin);
-  serialForm->addRow(QStringLiteral("停止位"), m_serialStopBitsSpin);
+  serialForm->addRow(QStringLiteral("波特率"), m_serialBaudCombo);
+  serialForm->addRow(QStringLiteral("数据位"), m_serialDataBitsCombo);
+  serialForm->addRow(QStringLiteral("停止位"), m_serialStopBitsCombo);
   serialForm->addRow(QStringLiteral("校验"), m_serialParityCombo);
   m_connectionStack->addWidget(serialFormWidget);
 
@@ -349,13 +499,14 @@ void MainWindow::setupUi() {
   m_modbusTcpPortSpin->setValue(502);
   m_modbusSerialPathCombo = new QComboBox;
   m_modbusSerialPathCombo->setEditable(true);
-  m_modbusBaudSpin = new QSpinBox;
-  m_modbusBaudSpin->setRange(1200, 2000000);
-  m_modbusBaudSpin->setValue(9600);
+  configureComboBox(m_modbusSerialPathCombo, 12, 160);
+  m_modbusBaudCombo = new QComboBox;
+  configureComboBox(m_modbusBaudCombo, 8, 120);
+  fillNumericCombo(m_modbusBaudCombo, commonBaudRates(), 9600);
   modbusForm->addRow(QStringLiteral("TCP Host"), m_modbusTcpHostEdit);
   modbusForm->addRow(QStringLiteral("TCP Port"), m_modbusTcpPortSpin);
   modbusForm->addRow(QStringLiteral("RTU 串口"), m_modbusSerialPathCombo);
-  modbusForm->addRow(QStringLiteral("RTU 波特率"), m_modbusBaudSpin);
+  modbusForm->addRow(QStringLiteral("RTU 波特率"), m_modbusBaudCombo);
   m_connectionStack->addWidget(modbusFormWidget);
 
   auto *canFormWidget = new QWidget;
@@ -368,10 +519,10 @@ void MainWindow::setupUi() {
   formPaneLayout->addWidget(wrapPanel(m_connectionStack, QStringLiteral("连接配置"), QStringLiteral("桌面端本地连接参数")), 1);
   consoleLayout->addWidget(formPane, 1);
 
-  m_tabs->addTab(consolePage, QStringLiteral("工作台"));
+  m_tabs->addTab(m_consolePage, QStringLiteral("工作台"));
 
-  auto *chartsPage = new QWidget;
-  auto *chartsLayout = new QVBoxLayout(chartsPage);
+  m_chartPage = new QWidget;
+  auto *chartsLayout = new QVBoxLayout(m_chartPage);
   chartsLayout->setContentsMargins(0, 0, 0, 0);
 #ifdef EBED_HAS_QT_CHARTS
   auto *chart = new QtCharts::QChart;
@@ -407,10 +558,10 @@ void MainWindow::setupUi() {
   m_chartFallbackView->setReadOnly(true);
   chartsLayout->addWidget(wrapPanel(m_chartFallbackView, QStringLiteral("图表降级视图"), QStringLiteral("当前构建未启用 Qt Charts，显示文本摘要")), 1);
 #endif
-  m_tabs->addTab(chartsPage, QStringLiteral("图表"));
+  m_tabs->addTab(m_chartPage, QStringLiteral("图表"));
 
-  auto *scriptsPage = new QWidget;
-  auto *scriptsLayout = new QHBoxLayout(scriptsPage);
+  m_scriptsPage = new QWidget;
+  auto *scriptsLayout = new QHBoxLayout(m_scriptsPage);
   scriptsLayout->setContentsMargins(0, 0, 0, 0);
   scriptsLayout->setSpacing(16);
   m_scriptList = new QListWidget;
@@ -423,6 +574,7 @@ void MainWindow::setupUi() {
   auto *scriptForm = new QFormLayout;
   m_scriptNameEdit = new QLineEdit;
   m_scriptChannelCombo = new QComboBox;
+  configureComboBox(m_scriptChannelCombo, 8, 140);
   for (const ChannelInfo &channel : m_channels) {
     m_scriptChannelCombo->addItem(channel.name, static_cast<int>(channel.key));
   }
@@ -453,36 +605,50 @@ void MainWindow::setupUi() {
   connect(m_scriptLoopCheck, &QCheckBox::toggled, this, [this](bool) { onScriptEdited(); });
   connect(m_scriptLinesEdit, &QPlainTextEdit::textChanged, this, &MainWindow::onScriptEdited);
   scriptsLayout->addWidget(wrapPanel(scriptEditor, QStringLiteral("脚本编辑器")), 2);
-  m_tabs->addTab(scriptsPage, QStringLiteral("脚本"));
+  m_tabs->addTab(m_scriptsPage, QStringLiteral("脚本"));
 
   m_templateTree = new QTreeWidget;
-  m_templateTree->setHeaderLabels({QStringLiteral("模板命令"), QStringLiteral("通道"), QStringLiteral("说明")});
+  m_templateTree->setHeaderLabels({QStringLiteral("模板命令"), QStringLiteral("目标"), QStringLiteral("说明")});
   connect(m_templateTree, &QTreeWidget::itemDoubleClicked, this, [this](QTreeWidgetItem *item, int column) { onTemplateActivated(item, column); });
-  auto *templatePage = new QWidget;
-  auto *templateLayout = new QVBoxLayout(templatePage);
+  m_templatePage = new QWidget;
+  auto *templateLayout = new QVBoxLayout(m_templatePage);
   templateLayout->setContentsMargins(0, 0, 0, 0);
   templateLayout->addWidget(wrapPanel(m_templateTree, QStringLiteral("协议模板"), QStringLiteral("双击命令可直接发送")), 1);
   auto *templateRunButton = new QPushButton(QStringLiteral("运行选中命令"));
   connect(templateRunButton, &QPushButton::clicked, this, &MainWindow::onRunTemplate);
   templateLayout->addWidget(templateRunButton, 0, Qt::AlignRight);
-  m_tabs->addTab(templatePage, QStringLiteral("模板"));
+  m_tabs->addTab(m_templatePage, QStringLiteral("模板"));
 
-  auto *protocolPage = new QWidget;
-  auto *protocolLayout = new QHBoxLayout(protocolPage);
+  m_protocolPage = new QWidget;
+  auto *protocolLayout = new QVBoxLayout(m_protocolPage);
   protocolLayout->setContentsMargins(0, 0, 0, 0);
-  protocolLayout->setSpacing(16);
+  m_protocolStack = new QStackedWidget;
+  protocolLayout->addWidget(m_protocolStack, 1);
 
+  m_protocolEmptyPage = new QWidget;
+  auto *protocolEmptyLayout = new QVBoxLayout(m_protocolEmptyPage);
+  protocolEmptyLayout->setContentsMargins(0, 0, 0, 0);
+  auto *protocolEmptyNote = new QLabel(QStringLiteral("当前通道没有独立协议工具。切换到 Modbus 或 CAN 后，这里会显示对应解析面板。"));
+  protocolEmptyNote->setWordWrap(true);
+  protocolEmptyLayout->addWidget(wrapPanel(protocolEmptyNote, QStringLiteral("协议工具"), QStringLiteral("按通道隔离显示")), 1);
+  m_protocolStack->addWidget(m_protocolEmptyPage);
+
+  m_protocolModbusPage = new QWidget;
+  auto *modbusPageLayout = new QVBoxLayout(m_protocolModbusPage);
+  modbusPageLayout->setContentsMargins(0, 0, 0, 0);
   auto *modbusPane = new QWidget;
   auto *modbusPaneLayout = new QVBoxLayout(modbusPane);
   modbusPaneLayout->setContentsMargins(0, 0, 0, 0);
   auto *modbusBuilderForm = new QFormLayout;
   m_modbusVariantCombo = new QComboBox;
+  configureComboBox(m_modbusVariantCombo, 5, 110);
   m_modbusVariantCombo->addItem("RTU", "rtu");
   m_modbusVariantCombo->addItem("TCP", "tcp");
   m_modbusUnitIdSpin = new QSpinBox;
   m_modbusUnitIdSpin->setRange(1, 255);
   m_modbusUnitIdSpin->setValue(1);
   m_modbusFunctionCombo = new QComboBox;
+  configureComboBox(m_modbusFunctionCombo, 18, 180);
   m_modbusFunctionCombo->addItem("03 Read Holding", 3);
   m_modbusFunctionCombo->addItem("04 Read Input", 4);
   m_modbusFunctionCombo->addItem("06 Write Single", 6);
@@ -520,8 +686,12 @@ void MainWindow::setupUi() {
   modbusPaneLayout->addWidget(new QLabel(QStringLiteral("响应解析")));
   modbusPaneLayout->addWidget(m_modbusDecodeEdit);
   modbusPaneLayout->addWidget(m_modbusDecodeLabel);
-  protocolLayout->addWidget(wrapPanel(modbusPane, QStringLiteral("Modbus 帧构造"), QStringLiteral("RTU 自动 CRC，TCP 自动 MBAP")), 1);
+  modbusPageLayout->addWidget(wrapPanel(modbusPane, QStringLiteral("Modbus 帧构造"), QStringLiteral("RTU 自动 CRC，TCP 自动 MBAP")), 1);
+  m_protocolStack->addWidget(m_protocolModbusPage);
 
+  m_protocolCanPage = new QWidget;
+  auto *canPageLayout = new QVBoxLayout(m_protocolCanPage);
+  canPageLayout->setContentsMargins(0, 0, 0, 0);
   auto *canPane = new QWidget;
   auto *canPaneLayout = new QVBoxLayout(canPane);
   canPaneLayout->setContentsMargins(0, 0, 0, 0);
@@ -571,11 +741,12 @@ void MainWindow::setupUi() {
     refreshProtocolViews();
   });
   canPaneLayout->addWidget(m_canSignalTable, 1);
-  protocolLayout->addWidget(wrapPanel(canPane, QStringLiteral("CAN 数据解析"), QStringLiteral("支持 11-bit / 29-bit ID 和 little-endian 信号")), 1);
-  m_tabs->addTab(protocolPage, QStringLiteral("协议"));
+  canPageLayout->addWidget(wrapPanel(canPane, QStringLiteral("CAN 数据解析"), QStringLiteral("支持 11-bit / 29-bit ID 和 little-endian 信号")), 1);
+  m_protocolStack->addWidget(m_protocolCanPage);
+  m_tabs->addTab(m_protocolPage, QStringLiteral("协议"));
 
-  auto *logsPage = new QWidget;
-  auto *logsLayout = new QVBoxLayout(logsPage);
+  m_logsPage = new QWidget;
+  auto *logsLayout = new QVBoxLayout(m_logsPage);
   logsLayout->setContentsMargins(0, 0, 0, 0);
   auto *searchRow = new QWidget;
   auto *searchRowLayout = new QHBoxLayout(searchRow);
@@ -599,10 +770,10 @@ void MainWindow::setupUi() {
   m_logTable->verticalHeader()->setVisible(false);
   m_logTable->setEditTriggers(QAbstractItemView::NoEditTriggers);
   logsLayout->addWidget(m_logTable, 1);
-  m_tabs->addTab(logsPage, QStringLiteral("日志"));
+  m_tabs->addTab(m_logsPage, QStringLiteral("日志"));
 
-  auto *reportPage = new QWidget;
-  auto *reportLayout = new QVBoxLayout(reportPage);
+  m_reportPage = new QWidget;
+  auto *reportLayout = new QVBoxLayout(m_reportPage);
   reportLayout->setContentsMargins(0, 0, 0, 0);
   m_reportSummaryLabel = new QLabel;
   m_reportSummaryLabel->setWordWrap(true);
@@ -614,7 +785,7 @@ void MainWindow::setupUi() {
   licenseNotes->setReadOnly(true);
   licenseNotes->setPlainText(QStringLiteral("桌面版建议继续补齐安装包发布、离线授权、设备配置库和协议插件化。Qt 方案更适合后续对接厂商 SDK、原生驱动和工业部署场景。"));
   reportLayout->addWidget(wrapPanel(licenseNotes, QStringLiteral("产品化备注")), 1);
-  m_tabs->addTab(reportPage, QStringLiteral("报告"));
+  m_tabs->addTab(m_reportPage, QStringLiteral("报告"));
 
   rootLayout->addWidget(sidebar);
   rootLayout->addWidget(workspace, 1);
@@ -636,8 +807,12 @@ void MainWindow::setupUi() {
 
   setStyleSheet(R"(
     QMainWindow { background: #f3f6fb; }
-    #sidebar { background: #0f172a; color: #e2e8f0; }
-    QListWidget { border: 1px solid #d7deea; background: white; }
+    #sidebar { background: #dde7dc; color: #1f2937; border-right: 1px solid #c7d4c5; }
+    QListWidget { border: 1px solid #d7deea; background: white; color: #0f172a; }
+    QListWidget#channelList { background: #f7faf7; border: 1px solid #c7d4c5; }
+    QListWidget#channelList::item { padding: 10px 12px; border-radius: 8px; }
+    QListWidget#channelList::item:selected { background: #1f6f78; color: white; }
+    QListWidget#channelList::item:hover:!selected { background: #d9eef0; color: #0f172a; }
     QTabWidget::pane { border: 0; }
     QTabBar::tab { padding: 10px 16px; background: #e5ebf4; margin-right: 4px; border-top-left-radius: 8px; border-top-right-radius: 8px; }
     QTabBar::tab:selected { background: white; }
@@ -651,8 +826,10 @@ void MainWindow::setupUi() {
 void MainWindow::populateChannels() {
   m_channelList->clear();
   for (const ChannelInfo &channel : m_channels) {
-    auto *item = new QListWidgetItem(QString("%1\n%2").arg(channel.name, channel.summary), m_channelList);
+    auto *item = new QListWidgetItem(channel.name, m_channelList);
     item->setData(Qt::UserRole, static_cast<int>(channel.key));
+    item->setToolTip(channel.summary);
+    item->setSizeHint(QSize(item->sizeHint().width(), 40));
   }
   m_channelList->setCurrentRow(0);
 }
@@ -685,10 +862,16 @@ void MainWindow::populateSerialPorts() {
 void MainWindow::populateTemplates() {
   m_templateTree->clear();
   for (const ProtocolTemplate &protocolTemplate : m_templates) {
-    auto *parent = new QTreeWidgetItem(m_templateTree, {protocolTemplate.name, protocolTemplate.target, protocolTemplate.description});
-    parent->setFirstColumnSpanned(true);
+    QTreeWidgetItem *parent = nullptr;
     for (const ProtocolCommand &command : protocolTemplate.commands) {
-      auto *child = new QTreeWidgetItem(parent, {command.name, channelKeyToString(command.channel).toUpper(), command.description});
+      if (command.channel != m_activeChannel) {
+        continue;
+      }
+      if (!parent) {
+        parent = new QTreeWidgetItem(m_templateTree, {protocolTemplate.name, protocolTemplate.target, protocolTemplate.description});
+        parent->setFirstColumnSpanned(true);
+      }
+      auto *child = new QTreeWidgetItem(parent, {command.name, protocolTemplate.target, command.description});
       child->setData(0, Qt::UserRole, static_cast<int>(command.channel));
       child->setData(0, Qt::UserRole + 1, command.payload);
       child->setData(0, Qt::UserRole + 2, static_cast<int>(command.format));
@@ -698,16 +881,24 @@ void MainWindow::populateTemplates() {
 }
 
 void MainWindow::populateScripts() {
+  const int previousIndex = currentScriptIndex();
   m_scriptList->clear();
+  int rowToSelect = -1;
+  int visibleRow = 0;
   for (const AutoScript &script : m_scripts) {
-    auto *item = new QListWidgetItem(QString("%1\n%2 · %3 ms").arg(script.name, channelKeyToString(script.channel).toUpper(), QString::number(script.intervalMs)), m_scriptList);
-    item->setData(Qt::UserRole, script.id);
-  }
-  if (!m_scripts.isEmpty()) {
-    m_scriptList->setCurrentRow(qMin(m_scriptList->currentRow(), m_scripts.size() - 1));
-    if (m_scriptList->currentRow() < 0) {
-      m_scriptList->setCurrentRow(0);
+    if (script.channel != m_activeChannel) {
+      continue;
     }
+    auto *item = new QListWidgetItem(QString("%1 · %2 ms").arg(script.name, QString::number(script.intervalMs)), m_scriptList);
+    item->setData(Qt::UserRole, script.id);
+    item->setToolTip(script.lines);
+    if (previousIndex >= 0 && m_scripts.at(previousIndex).id == script.id) {
+      rowToSelect = visibleRow;
+    }
+    ++visibleRow;
+  }
+  if (m_scriptList->count() > 0) {
+    m_scriptList->setCurrentRow(rowToSelect >= 0 ? rowToSelect : 0);
   }
 }
 
@@ -726,6 +917,7 @@ void MainWindow::populateCanSignals() {
 }
 
 void MainWindow::refreshAllViews() {
+  refreshTabVisibility();
   refreshHeader();
   refreshConnectionForm();
   refreshMetrics();
@@ -738,20 +930,36 @@ void MainWindow::refreshAllViews() {
   m_runtimeLabel->setText(QStringLiteral("Qt 桌面端"));
   m_serialSupportLabel->setText(serialSupportAvailable() ? QStringLiteral("可用") : QStringLiteral("未编译（需 qt6-serialport-dev）"));
   m_serialSupportLabel->setToolTip(serialSupportAvailable() ? QString() : serialModuleHint());
-  m_mqttSupportLabel->setText(mqttSupportAvailable() ? QStringLiteral("可用") : QStringLiteral("未编译（需 qt6-mqtt-dev）"));
+  m_mqttSupportLabel->setText(mqttSupportAvailable() ? QStringLiteral("可用") : QStringLiteral("未编译（需 libmosquitto-dev）"));
   m_mqttSupportLabel->setToolTip(mqttSupportAvailable() ? QString() : mqttModuleHint());
+}
+
+void MainWindow::refreshTabVisibility() {
+  const int protocolTabIndex = m_tabs->indexOf(m_protocolPage);
+  const bool protocolVisible = channelHasProtocolTools(m_activeChannel);
+  m_tabs->setTabVisible(protocolTabIndex, protocolVisible);
+  if (!protocolVisible && m_tabs->currentIndex() == protocolTabIndex) {
+    m_tabs->setCurrentWidget(m_consolePage);
+  }
 }
 
 void MainWindow::refreshHeader() {
   const QString name = channelKeyToDisplayName(m_activeChannel);
   m_activeChannelLabel->setText(QString("<div style='font-size:12px;color:#64748b'>当前通道</div><div style='font-size:24px;font-weight:700'>%1</div>").arg(name));
+  for (const ChannelInfo &channel : m_channels) {
+    if (channel.key == m_activeChannel) {
+      m_activeChannelSummaryLabel->setText(QString("<span style='font-size:14px;color:#64748b'>%1</span>").arg(channel.summary));
+      break;
+    }
+  }
+  m_searchEdit->setPlaceholderText(QStringLiteral("搜索 %1 日志").arg(name));
   const QString modbusVariant = m_modbusVariantCombo ? m_modbusVariantCombo->currentData().toString() : QStringLiteral("rtu");
   const QString unsupportedMessage = unsupportedChannelMessage(m_activeChannel, modbusVariant);
 
   if (m_activeChannel == ChannelKey::Can) {
-    m_connectButton->setEnabled(false);
-    m_connectButton->setText(QStringLiteral("解析工具"));
-    m_connectButton->setToolTip(QString());
+    m_connectButton->setEnabled(true);
+    m_connectButton->setText(QStringLiteral("进入解析"));
+    m_connectButton->setToolTip(QStringLiteral("切换到 CAN 协议解析工具"));
   } else if (isConnected(m_activeChannel)) {
     m_connectButton->setEnabled(true);
     m_connectButton->setText(QStringLiteral("断开"));
@@ -770,13 +978,26 @@ void MainWindow::refreshHeader() {
 }
 
 void MainWindow::refreshTerminal() {
+  if (m_terminalViewModeCombo && m_terminalViewModeCombo->parentWidget()) {
+    m_terminalViewModeCombo->parentWidget()->setVisible(m_activeChannel == ChannelKey::Serial);
+  }
   QStringList lines;
+  const QString terminalMode = m_activeChannel == ChannelKey::Serial ? m_terminalViewModeCombo->currentData().toString() : QString();
   int count = 0;
-  for (const LogEntry &log : m_logs) {
-    if (log.channel != m_activeChannel) {
-      continue;
+  for (const LogEntry &log : filteredLogs()) {
+    const QString payload = terminalPayloadText(log, terminalMode);
+    QString detail = log.decoded;
+    if (m_activeChannel == ChannelKey::Serial && log.direction != Direction::Sys) {
+      detail.clear();
+    } else if (detail == log.payload || detail == payload) {
+      detail.clear();
     }
-    lines.prepend(QString("%1  %2  %3\n%4").arg(log.ts, directionToString(log.direction).toUpper(), log.payload, log.decoded));
+
+    QString line = QString("%1  %2  %3").arg(log.ts, directionToString(log.direction).toUpper(), payload);
+    if (!detail.isEmpty()) {
+      line += QStringLiteral("\n") + detail;
+    }
+    lines.prepend(line);
     ++count;
     if (count >= 120) {
       break;
@@ -788,7 +1009,10 @@ void MainWindow::refreshTerminal() {
 void MainWindow::refreshLogTable() {
   const QString term = m_searchEdit->text().trimmed().toLower();
   QVector<LogEntry> filtered;
-  for (const LogEntry &log : m_logs) {
+  for (const LogEntry &log : filteredLogs()) {
+    if (log.direction != Direction::Sys) {
+      continue;
+    }
     const QString haystack = QString("%1 %2 %3 %4 %5 %6 %7")
       .arg(log.ts, channelKeyToString(log.channel), directionToString(log.direction), payloadFormatToString(log.format), log.payload, log.decoded, log.meta)
       .toLower();
@@ -810,32 +1034,33 @@ void MainWindow::refreshLogTable() {
 }
 
 void MainWindow::refreshMetrics() {
+  const QVector<LogEntry> logs = filteredLogs();
   int bytes = 0;
   int rx = 0;
   int tx = 0;
-  int online = 0;
-  for (bool value : m_connected) {
-    if (value) ++online;
-  }
-  for (const LogEntry &log : m_logs) {
+  for (const LogEntry &log : logs) {
     bytes += log.bytes;
     if (log.direction == Direction::Rx) ++rx;
     if (log.direction == Direction::Tx) ++tx;
   }
-  m_onlineMetric->setText(metricText(QStringLiteral("在线通道"), QString("%1 / %2").arg(online).arg(m_channels.size() - 1)));
+  QString state = m_activeChannel == ChannelKey::Can
+    ? QStringLiteral("本地工具")
+    : (isConnected(m_activeChannel) ? QStringLiteral("在线") : QStringLiteral("离线"));
+  m_onlineMetric->setText(metricText(QStringLiteral("连接状态"), state));
   m_rxMetric->setText(metricText(QStringLiteral("RX 帧"), QString::number(rx)));
   m_txMetric->setText(metricText(QStringLiteral("TX 帧"), QString::number(tx)));
   m_bytesMetric->setText(metricText(QStringLiteral("累计字节"), QString::number(bytes)));
 }
 
 void MainWindow::refreshChart() {
+  const QVector<ChartPoint> points = filteredChartPoints();
 #ifdef EBED_HAS_QT_CHARTS
   m_voltageSeries->clear();
   m_currentSeries->clear();
   m_temperatureSeries->clear();
   m_rpmSeries->clear();
-  for (int index = 0; index < m_chartPoints.size(); ++index) {
-    const ChartPoint &point = m_chartPoints.at(index);
+  for (int index = 0; index < points.size(); ++index) {
+    const ChartPoint &point = points.at(index);
     m_voltageSeries->append(index, point.voltage);
     m_currentSeries->append(index, point.current);
     m_temperatureSeries->append(index, point.temperature);
@@ -844,7 +1069,7 @@ void MainWindow::refreshChart() {
   auto *chart = m_chartView->chart();
   if (!chart->axes(Qt::Horizontal).isEmpty()) {
     if (auto *axis = qobject_cast<QtCharts::QValueAxis *>(chart->axes(Qt::Horizontal).first())) {
-      axis->setRange(0, qMax(10, m_chartPoints.size()));
+      axis->setRange(0, qMax(10, points.size()));
     }
   }
   if (!chart->axes(Qt::Vertical).isEmpty()) {
@@ -853,10 +1078,14 @@ void MainWindow::refreshChart() {
     }
   }
 #else
-  const ChartPoint point = m_chartPoints.isEmpty() ? ChartPoint{} : m_chartPoints.last();
+  if (points.isEmpty()) {
+    m_chartFallbackView->setPlainText(QStringLiteral("当前通道暂无可提取的图表数据。"));
+    return;
+  }
+  const ChartPoint point = points.last();
   m_chartFallbackView->setPlainText(
     QStringLiteral("当前样本数：%1\n最新时间：%2\n电压：%3 V\n电流：%4 A\n温度：%5 C\n转速：%6 rpm")
-      .arg(m_chartPoints.size())
+      .arg(points.size())
       .arg(point.time)
       .arg(point.voltage, 0, 'f', 2)
       .arg(point.current, 0, 'f', 2)
@@ -867,16 +1096,17 @@ void MainWindow::refreshChart() {
 }
 
 void MainWindow::refreshScriptEditor() {
-  const int index = m_scriptList->currentRow();
+  const int index = currentScriptIndex();
   const bool valid = index >= 0 && index < m_scripts.size();
   m_scriptNameEdit->setEnabled(valid);
-  m_scriptChannelCombo->setEnabled(valid);
+  m_scriptChannelCombo->setEnabled(false);
   m_scriptIntervalSpin->setEnabled(valid);
   m_scriptLoopCheck->setEnabled(valid);
   m_scriptLinesEdit->setEnabled(valid);
   m_scriptToggleButton->setEnabled(valid);
   if (!valid) {
     m_scriptNameEdit->clear();
+    m_scriptChannelCombo->setCurrentIndex(m_scriptChannelCombo->findData(static_cast<int>(m_activeChannel)));
     m_scriptLinesEdit->clear();
     m_scriptToggleButton->setText(QStringLiteral("运行"));
     return;
@@ -898,6 +1128,14 @@ void MainWindow::refreshScriptEditor() {
 }
 
 void MainWindow::refreshProtocolViews() {
+  if (m_activeChannel == ChannelKey::Modbus) {
+    m_protocolStack->setCurrentWidget(m_protocolModbusPage);
+  } else if (m_activeChannel == ChannelKey::Can) {
+    m_protocolStack->setCurrentWidget(m_protocolCanPage);
+  } else {
+    m_protocolStack->setCurrentWidget(m_protocolEmptyPage);
+  }
+
   ModbusBuilderState state;
   state.variant = m_modbusVariantCombo->currentData().toString();
   state.unitId = m_modbusUnitIdSpin->value();
@@ -927,16 +1165,19 @@ void MainWindow::refreshProtocolViews() {
 }
 
 void MainWindow::refreshReportSummary() {
+  const QVector<LogEntry> logs = filteredLogs();
+  const QVector<ChartPoint> points = filteredChartPoints();
   int rx = 0;
   int tx = 0;
-  for (const LogEntry &log : m_logs) {
+  for (const LogEntry &log : logs) {
     if (log.direction == Direction::Rx) ++rx;
     if (log.direction == Direction::Tx) ++tx;
   }
   m_reportSummaryLabel->setText(
-    QStringLiteral("日志条数：%1\n图表点：%2\nRX：%3\nTX：%4\n导出内容包含当前日志、统计摘要和最近图表样本。")
-      .arg(m_logs.size())
-      .arg(m_chartPoints.size())
+    QStringLiteral("当前通道：%1\n日志条数：%2\n图表点：%3\nRX：%4\nTX：%5\n导出内容仅包含当前通道日志、统计摘要和图表样本。")
+      .arg(channelKeyToDisplayName(m_activeChannel))
+      .arg(logs.size())
+      .arg(points.size())
       .arg(rx)
       .arg(tx)
   );
@@ -955,6 +1196,8 @@ void MainWindow::refreshConnectionForm() {
 
 void MainWindow::selectChannel(ChannelKey channel) {
   m_activeChannel = channel;
+  populateTemplates();
+  populateScripts();
   refreshAllViews();
 }
 
@@ -986,10 +1229,25 @@ void MainWindow::addLog(ChannelKey channel, Direction direction, PayloadFormat f
   entry.meta = meta;
 
   if (direction == Direction::Rx) {
-    const ChartPoint previous = m_chartPoints.isEmpty() ? ChartPoint{0, nowStamp(), 3.3, 0.42, 35.0, 1200.0} : m_chartPoints.last();
-    m_chartPoints.append(extractMetrics(entry, previous));
-    if (m_chartPoints.size() > 180) {
-      m_chartPoints.remove(0, m_chartPoints.size() - 180);
+    ChartPoint previous{0, nowStamp(), 3.3, 0.42, 35.0, 1200.0, channel};
+    for (int index = m_chartPoints.size() - 1; index >= 0; --index) {
+      if (m_chartPoints.at(index).channel == channel) {
+        previous = m_chartPoints.at(index);
+        break;
+      }
+    }
+    ChartPoint point = extractMetrics(entry, previous);
+    point.channel = channel;
+    m_chartPoints.append(point);
+    int channelPointCount = 0;
+    for (int index = m_chartPoints.size() - 1; index >= 0; --index) {
+      if (m_chartPoints.at(index).channel != channel) {
+        continue;
+      }
+      ++channelPointCount;
+      if (channelPointCount > 180) {
+        m_chartPoints.removeAt(index);
+      }
     }
   }
 
@@ -1140,10 +1398,10 @@ QVariantMap MainWindow::configForChannel(ChannelKey channel) const {
     case ChannelKey::Serial:
       return {
         {"path", m_serialPathCombo->currentText()},
-        {"baudRate", m_serialBaudSpin->value()},
-        {"dataBits", m_serialDataBitsSpin->value()},
-        {"stopBits", m_serialStopBitsSpin->value()},
-        {"parity", m_serialParityCombo->currentText()}
+        {"baudRate", comboNumber(m_serialBaudCombo, 115200)},
+        {"dataBits", comboNumber(m_serialDataBitsCombo, 8)},
+        {"stopBits", comboNumber(m_serialStopBitsCombo, 1)},
+        {"parity", m_serialParityCombo->currentData().toString()}
       };
     case ChannelKey::Tcp:
       return {
@@ -1174,7 +1432,7 @@ QVariantMap MainWindow::configForChannel(ChannelKey channel) const {
       }
       return {
         {"path", m_modbusSerialPathCombo->currentText()},
-        {"baudRate", m_modbusBaudSpin->value()},
+        {"baudRate", comboNumber(m_modbusBaudCombo, 9600)},
         {"dataBits", 8},
         {"stopBits", 1},
         {"parity", "none"}
@@ -1189,8 +1447,44 @@ PayloadFormat MainWindow::currentTxFormat() const {
   return static_cast<PayloadFormat>(m_txFormatCombo->currentData().toInt());
 }
 
+QVector<LogEntry> MainWindow::filteredLogs() const {
+  QVector<LogEntry> filtered;
+  filtered.reserve(m_logs.size());
+  for (const LogEntry &log : m_logs) {
+    if (log.channel == m_activeChannel) {
+      filtered.append(log);
+    }
+  }
+  return filtered;
+}
+
+QVector<ChartPoint> MainWindow::filteredChartPoints() const {
+  QVector<ChartPoint> filtered;
+  filtered.reserve(m_chartPoints.size());
+  for (const ChartPoint &point : m_chartPoints) {
+    if (point.channel == m_activeChannel) {
+      filtered.append(point);
+    }
+  }
+  return filtered;
+}
+
+int MainWindow::currentScriptIndex() const {
+  auto *item = m_scriptList->currentItem();
+  if (!item) {
+    return -1;
+  }
+  const QString scriptId = item->data(Qt::UserRole).toString();
+  for (int index = 0; index < m_scripts.size(); ++index) {
+    if (m_scripts.at(index).id == scriptId) {
+      return index;
+    }
+  }
+  return -1;
+}
+
 QStringList MainWindow::activeScriptLines() const {
-  const int index = m_scriptList->currentRow();
+  const int index = currentScriptIndex();
   if (index < 0 || index >= m_scripts.size()) {
     return {};
   }
@@ -1229,6 +1523,10 @@ void MainWindow::onChannelSelectionChanged() {
 }
 
 void MainWindow::onConnectClicked() {
+  if (m_activeChannel == ChannelKey::Can) {
+    m_tabs->setCurrentWidget(m_protocolPage);
+    return;
+  }
   connectChannel(m_activeChannel);
 }
 
@@ -1248,7 +1546,6 @@ void MainWindow::onRecordingClicked() {
 void MainWindow::onClearLogsClicked() {
   m_logs.clear();
   m_chartPoints.clear();
-  m_chartPoints.append(ChartPoint{0, nowStamp(), 3.3, 0.42, 35.0, 1200.0});
   refreshAllViews();
 }
 
@@ -1285,7 +1582,7 @@ void MainWindow::onScriptSelectionChanged() {
 }
 
 void MainWindow::onToggleScript() {
-  const int index = m_scriptList->currentRow();
+  const int index = currentScriptIndex();
   if (index < 0 || index >= m_scripts.size()) {
     return;
   }
@@ -1338,23 +1635,22 @@ void MainWindow::onAddScript() {
   const QString id = QString("script-%1").arg(QDateTime::currentMSecsSinceEpoch());
   m_scripts.append(AutoScript{id, QStringLiteral("新脚本"), m_activeChannel, 1000, true, "PING"});
   populateScripts();
-  m_scriptList->setCurrentRow(m_scripts.size() - 1);
+  m_scriptList->setCurrentRow(qMax(0, m_scriptList->count() - 1));
 }
 
 void MainWindow::onScriptEdited() {
-  const int index = m_scriptList->currentRow();
+  const int index = currentScriptIndex();
   if (index < 0 || index >= m_scripts.size()) {
     return;
   }
 
   AutoScript &script = m_scripts[index];
   script.name = m_scriptNameEdit->text();
-  script.channel = static_cast<ChannelKey>(m_scriptChannelCombo->currentData().toInt());
+  script.channel = m_activeChannel;
   script.intervalMs = m_scriptIntervalSpin->value();
   script.loop = m_scriptLoopCheck->isChecked();
   script.lines = m_scriptLinesEdit->toPlainText();
   populateScripts();
-  m_scriptList->setCurrentRow(index);
 }
 
 void MainWindow::onSendGeneratedModbus() {
@@ -1368,12 +1664,19 @@ void MainWindow::onParseCanFrame() {
 }
 
 void MainWindow::onExportCsv() {
-  saveTextFile(QStringLiteral("导出 CSV"), "ebed-debug-log.csv", logsToCsv(m_logs), "CSV (*.csv)");
+  saveTextFile(
+    QStringLiteral("导出 CSV"),
+    QString("ebed-debug-%1-log.csv").arg(channelKeyToString(m_activeChannel)),
+    logsToCsv(filteredLogs()),
+    "CSV (*.csv)"
+  );
 }
 
 void MainWindow::onExportJson() {
+  const QVector<LogEntry> logs = filteredLogs();
+  const QVector<ChartPoint> points = filteredChartPoints();
   QJsonArray logsArray;
-  for (const LogEntry &log : m_logs) {
+  for (const LogEntry &log : logs) {
     QJsonObject object;
     object["time"] = log.ts;
     object["channel"] = channelKeyToString(log.channel);
@@ -1387,7 +1690,7 @@ void MainWindow::onExportJson() {
   }
 
   QJsonArray chartArray;
-  for (const ChartPoint &point : m_chartPoints) {
+  for (const ChartPoint &point : points) {
     QJsonObject object;
     object["id"] = point.id;
     object["time"] = point.time;
@@ -1400,11 +1703,22 @@ void MainWindow::onExportJson() {
 
   QJsonObject root;
   root["exportedAt"] = QDateTime::currentDateTime().toString(Qt::ISODate);
+  root["activeChannel"] = channelKeyToString(m_activeChannel);
   root["logs"] = logsArray;
   root["chartPoints"] = chartArray;
-  saveTextFile(QStringLiteral("导出 JSON"), "ebed-debug-log.json", QString::fromUtf8(QJsonDocument(root).toJson(QJsonDocument::Indented)), "JSON (*.json)");
+  saveTextFile(
+    QStringLiteral("导出 JSON"),
+    QString("ebed-debug-%1-log.json").arg(channelKeyToString(m_activeChannel)),
+    QString::fromUtf8(QJsonDocument(root).toJson(QJsonDocument::Indented)),
+    "JSON (*.json)"
+  );
 }
 
 void MainWindow::onExportReport() {
-  saveTextFile(QStringLiteral("导出 HTML 报告"), "ebed-debug-report.html", buildHtmlReport(m_logs, m_chartPoints), "HTML (*.html)");
+  saveTextFile(
+    QStringLiteral("导出 HTML 报告"),
+    QString("ebed-debug-%1-report.html").arg(channelKeyToString(m_activeChannel)),
+    buildHtmlReport(filteredLogs(), filteredChartPoints()),
+    "HTML (*.html)"
+  );
 }

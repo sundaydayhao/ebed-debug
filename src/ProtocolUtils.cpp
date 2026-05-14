@@ -248,7 +248,7 @@ CanFrame parseCanFrameText(const QString &input, bool *ok) {
     const QString data = normalizeHex(match.captured(2));
     return CanFrame{
       match.captured(1).toUpper(),
-      qMin(8, hexToBytes(match.captured(2)).size()),
+      static_cast<int>(qMin<qsizetype>(8, hexToBytes(match.captured(2)).size())),
       data,
       match.captured(1).size() > 3
     };
@@ -262,7 +262,7 @@ CanFrame parseCanFrameText(const QString &input, bool *ok) {
       *ok = true;
     }
     const QString data = normalizeHex(parts.mid(1).join(' '));
-    return CanFrame{id.toUpper(), hexToBytes(data).size(), data, id.size() > 3};
+    return CanFrame{id.toUpper(), static_cast<int>(hexToBytes(data).size()), data, id.size() > 3};
   }
 
   if (ok) {

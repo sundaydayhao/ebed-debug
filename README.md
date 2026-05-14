@@ -7,7 +7,7 @@
 - 串口调试：端口、波特率、数据位、停止位、校验配置；依赖 `Qt6 SerialPort`。
 - TCP 调试：基于 `QTcpSocket` 建立连接、发送和接收。
 - UDP 调试：基于 `QUdpSocket` 绑定本地端口并向远端发送。
-- MQTT 调试：基于 `Qt6 MQTT` 连接 Broker、订阅和发布 Topic。
+- MQTT 调试：基于 `libmosquitto` 连接 Broker、订阅和发布 Topic。
 - Modbus RTU/TCP：RTU 自动 CRC16，TCP 自动 MBAP，支持 FC03、FC04、FC06、FC16 帧生成和响应解析。
 - CAN 数据解析：支持 `18FF50E5#112233...` 和空格分隔格式，提供 little-endian 信号解析和换算。
 - 数据图表：从 RX JSON、文本数字和 Modbus 响应中提取电压、电流、温度、转速。
@@ -21,7 +21,7 @@
 
 - `cmake >= 3.21`
 - `Qt6 Core / Gui / Widgets / Network`
-- 可选：`Qt6 SerialPort`、`Qt6 Charts`、`Qt6 MQTT`
+- 可选：`Qt6 SerialPort`、`Qt6 Charts`、`libmosquitto`
 
 构建命令：
 
@@ -39,7 +39,7 @@ cmake --build build
 如果系统里没有完整的 Qt6 开发包，`cmake` 会直接失败。建议优先安装以下模块：
 
 ```bash
-sudo apt install qt6-base-dev qt6-serialport-dev qt6-charts-dev qt6-mqtt-dev
+sudo apt install qt6-base-dev qt6-serialport-dev qt6-charts-dev libmosquitto-dev
 ```
 
 不同发行版包名可能略有差异。
@@ -55,7 +55,7 @@ sudo apt install qt6-base-dev qt6-serialport-dev qt6-charts-dev qt6-mqtt-dev
 ## 说明
 
 - CAN 当前仍是本地帧解析工具，不直接对接真实 CAN 适配器。
-- 如果未安装 `Qt6 SerialPort` 或 `Qt6 MQTT`，程序仍可编译，但对应通道会在运行时提示模块不可用。
+- 如果未安装 `Qt6 SerialPort` 或 `libmosquitto`，程序仍可编译，但对应通道会在运行时提示模块不可用。
 - 如果未安装 `Qt6 Charts`，图表页会降级为文本摘要视图。
 
 ## 后续建议

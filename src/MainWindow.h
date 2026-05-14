@@ -48,6 +48,7 @@ private:
   void populateScripts();
   void populateCanSignals();
   void refreshAllViews();
+  void refreshTabVisibility();
   void refreshHeader();
   void refreshTerminal();
   void refreshLogTable();
@@ -68,6 +69,9 @@ private:
   AbstractTransportClient *buildClient(ChannelKey channel);
   QVariantMap configForChannel(ChannelKey channel) const;
   PayloadFormat currentTxFormat() const;
+  QVector<LogEntry> filteredLogs() const;
+  QVector<ChartPoint> filteredChartPoints() const;
+  int currentScriptIndex() const;
   QStringList activeScriptLines() const;
   void stopScript(const QString &scriptId, bool logStop = true);
 
@@ -106,6 +110,7 @@ private:
 
   QListWidget *m_channelList = nullptr;
   QLabel *m_activeChannelLabel = nullptr;
+  QLabel *m_activeChannelSummaryLabel = nullptr;
   QLabel *m_runtimeLabel = nullptr;
   QLabel *m_serialSupportLabel = nullptr;
   QLabel *m_mqttSupportLabel = nullptr;
@@ -116,16 +121,24 @@ private:
   QLabel *m_txMetric = nullptr;
   QLabel *m_bytesMetric = nullptr;
   QTabWidget *m_tabs = nullptr;
+  QWidget *m_consolePage = nullptr;
+  QWidget *m_chartPage = nullptr;
+  QWidget *m_scriptsPage = nullptr;
+  QWidget *m_templatePage = nullptr;
+  QWidget *m_protocolPage = nullptr;
+  QWidget *m_logsPage = nullptr;
+  QWidget *m_reportPage = nullptr;
 
   QPlainTextEdit *m_terminalView = nullptr;
+  QComboBox *m_terminalViewModeCombo = nullptr;
   QComboBox *m_txFormatCombo = nullptr;
   QPlainTextEdit *m_txEditor = nullptr;
   QStackedWidget *m_connectionStack = nullptr;
 
   QComboBox *m_serialPathCombo = nullptr;
-  QSpinBox *m_serialBaudSpin = nullptr;
-  QSpinBox *m_serialDataBitsSpin = nullptr;
-  QSpinBox *m_serialStopBitsSpin = nullptr;
+  QComboBox *m_serialBaudCombo = nullptr;
+  QComboBox *m_serialDataBitsCombo = nullptr;
+  QComboBox *m_serialStopBitsCombo = nullptr;
   QComboBox *m_serialParityCombo = nullptr;
 
   QLineEdit *m_tcpHostEdit = nullptr;
@@ -145,7 +158,7 @@ private:
   QLineEdit *m_modbusTcpHostEdit = nullptr;
   QSpinBox *m_modbusTcpPortSpin = nullptr;
   QComboBox *m_modbusSerialPathCombo = nullptr;
-  QSpinBox *m_modbusBaudSpin = nullptr;
+  QComboBox *m_modbusBaudCombo = nullptr;
 
   QLineEdit *m_canInputEdit = nullptr;
 
@@ -168,6 +181,10 @@ private:
   QPushButton *m_scriptToggleButton = nullptr;
 
   QTreeWidget *m_templateTree = nullptr;
+  QStackedWidget *m_protocolStack = nullptr;
+  QWidget *m_protocolEmptyPage = nullptr;
+  QWidget *m_protocolModbusPage = nullptr;
+  QWidget *m_protocolCanPage = nullptr;
 
   QComboBox *m_modbusVariantCombo = nullptr;
   QSpinBox *m_modbusUnitIdSpin = nullptr;
