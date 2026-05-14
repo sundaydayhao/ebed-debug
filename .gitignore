@@ -4,3 +4,7 @@ dist-electron
 .DS_Store
 *.log
 *.tsbuildinfo
+build
+cmake-build-*
+*.user
+*.autosave
